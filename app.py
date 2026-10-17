@@ -94,6 +94,138 @@ REACTION_EMOJIS = {
 }
 REACTION_TYPES = list(REACTION_EMOJIS.keys())
 
+# We strip out generic filler words 
+STOPWORDS = {
+    'the','a','an','and','or','but','if','then','else','for','with','without','from','into','onto',
+    'this','that','these','those','about','after','before','while','when','where','who','what','why',
+    'how','your','you','our','we','they','them','their','his','her','she','he','it','its','is','are',
+    'was','were','be','been','being','of','in','on','at','to','as','by','up','down','out','over','under',
+    'not','no','yes','very','more','most','some','many','much','can','could','should','would','will','just',
+    'also','too','have','has','had','do','does','did','make','made','again','there','here','than','them',
+    'between','through','during','once','because','among','within','thanks','post','comment','like','user',
+    'users','people','community','social','feed','platform','content','app','website','please','wow','love',
+    'lol','haha','hahaha','amazing','awesome','great','good','nice','cool','fun','happy','sad','angry',
+    'excited','interesting','interestingly','favorite','favourite','shared','sharing','today','tomorrow',
+    'yesterday','morning','evening','night','week','weekend','story','stories','stuff','thing','things'
+}
+
+# Turn free text into a small set of useful topic keywords.
+def extract_keywords(text, limit=8):
+    if not text:
+        return []
+
+    # Pull out word-like tokens from the text.
+    words = re.findall(r"[A-Za-z][A-Za-z0-9_'-]{2,}", str(text))
+    keywords = []
+
+    for word in words:
+        clean = word.lower().strip("'\"")
+        if clean.endswith("'s"):
+            clean = clean[:-2]
+
+        # Ignore too-short or noisy words.
+        if len(clean) < 3 or clean in STOPWORDS:
+            continue
+
+        keywords.append(clean)
+
+    # Count repeats so the most relevant words stand out.
+    counts = collections.Counter(keywords)
+    return [word for word, _ in counts.most_common(limit)]
+
+
+# Build a user's profile of interests from their bio + posts + comments.
+def get_user_interest_keywords(user_id):
+    if not user_id:
+        return set()
+
+    interests = set()
+
+    user = query_db('SELECT profile FROM users WHERE id = ?', (user_id,), one=True)
+    if user and user['profile']:
+        interests.update(extract_keywords(user['profile'], limit=12))
+
+    for row in query_db('SELECT content FROM posts WHERE user_id = ?', (user_id,)):
+        interests.update(extract_keywords(row['content'], limit=12))
+    for row in query_db('SELECT content FROM comments WHERE user_id = ?', (user_id,)):
+        interests.update(extract_keywords(row['content'], limit=12))
+
+    return interests
+
+
+# Create a small "queue" of likely, useful contribution opportunities.
+# There is ranking so that the most relevant and timely suggestions are at the top.
+def build_contribution_tasks(user_id, limit=5):
+    if not user_id:
+        return []
+
+    # Fallback interests help new users get relevant suggestions even before they post much.
+    interests = get_user_interest_keywords(user_id)
+    if not interests:
+        interests = {'diy', 'craft', 'build', 'repair', 'garden', 'learn', 'create'}
+
+    # Followed authors are boosted so a user's social circle is prioritized.
+    followed_ids = set(
+        row['followed_id']
+        for row in query_db('SELECT followed_id FROM follows WHERE follower_id = ?', (user_id,))
+    )
+
+    tasks = []
+
+    # Only look at recent posts from other users so the queue feels active and current.
+    for post in query_db('''
+        SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+        FROM posts p
+        JOIN users u ON p.user_id = u.id
+        WHERE p.user_id != ?
+        ORDER BY p.created_at DESC
+        LIMIT 200
+    ''', (user_id,)):
+        # Skip posts the user already engaged with so the queue stays useful.
+        if query_db('SELECT 1 FROM comments WHERE post_id = ? AND user_id = ?', (post['id'], user_id), one=True):
+            continue
+        if query_db('SELECT 1 FROM reactions WHERE post_id = ? AND user_id = ?', (post['id'], user_id), one=True):
+            continue
+
+        # Extract keywords from the post and match them against the user's interests.
+        post_keywords = set(extract_keywords(post['content'], limit=10))
+        match_keywords = sorted(post_keywords & interests)
+        is_followed_author = post['user_id'] in followed_ids
+
+        # Ignore irrelevant posts unless the author is someone the user follows.
+        if not match_keywords and not is_followed_author:
+            continue
+
+        # Higher score means more likely to be suggested.
+        # Followed author gets a big boost, even if the text is only loosely relevant.
+        if is_followed_author:
+            priority = 100 + len(match_keywords) * 10
+            reason = 'Followed member'
+            summary = f"Check out {post['username']}'s recent post and contribute"
+            if match_keywords:
+                reason = f"Match: {', '.join(match_keywords[:3])}"
+                summary = f"Reply to {post['username']} about {', '.join(match_keywords[:3])}"
+        else:
+            priority = len(match_keywords) * 10 + 5
+            reason = f"Match: {', '.join(match_keywords[:3])}"
+            summary = f"Reply to {post['username']} about {', '.join(match_keywords[:3])}"
+
+        tasks.append({
+            'post_id': post['id'],
+            'user_id': post['user_id'],
+            'username': post['username'],
+            'content': post['content'],
+            'created_at': post['created_at'],
+            'match_score': priority,
+            'keywords': match_keywords,
+            'summary': summary,
+            'reason': reason,
+        })
+
+    # Put the highest-priority contribution opportunities at the top.
+    tasks.sort(key=lambda task: (task['match_score'], task['created_at']), reverse=True)
+    return tasks[:limit]
+
 
 @app.route('/')
 def feed():
@@ -191,13 +323,18 @@ def feed():
             'comments': comments_moderated
         })
 
+    tasks = []
+    if current_user_id:
+        tasks = build_contribution_tasks(current_user_id, limit=5)
+
     #  4. Render Template with Pagination Info 
     return render_template('feed.html.j2', 
-                           posts=posts_data, 
+                           posts=posts_data,
+                           tasks=tasks,
                            current_sort=sort,
                            current_show=show,
-                           page=page, # Pass current page number
-                           per_page=POSTS_PER_PAGE, # Pass items per page
+                           page=page,
+                           per_page=POSTS_PER_PAGE,
                            reaction_emojis=REACTION_EMOJIS,
                            reaction_types=REACTION_TYPES)
 

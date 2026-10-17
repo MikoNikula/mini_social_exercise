@@ -24,6 +24,43 @@
 
 <h2 class="text-center border-bottom pb-2 mb-4"><span>Posts</span></h2>
 
+{% if session.get('user_id') %}
+<div class="col-md-8 mx-auto mb-4">
+  <div class="card border-0 shadow-sm bg-primary-subtle">
+    <div class="card-body">
+      <div class="d-flex justify-content-between align-items-center mb-2">
+        <h5 class="card-title mb-0 text-dark">Your contribution queue</h5>
+        <span class="badge bg-dark rounded-pill">{{ tasks|length }} open</span>
+      </div>
+      {% if tasks %}
+      <div class="list-group list-group-flush">
+        {% for task in tasks %}
+        <a class="list-group-item list-group-item-action border-0 rounded mb-2 bg-white" href="/posts/{{ task.post_id }}">
+          <div class="d-flex justify-content-between align-items-start gap-3">
+            <div>
+              <div class="fw-semibold text-dark">{{ task.summary }}</div>
+              <small class="text-muted">From @{{ task.username }} · {{ task.created_at|datetimeformat }}</small>
+              {% if task.keywords %}
+              <div class="mt-2">
+                {% for keyword in task.keywords %}
+                <span class="badge bg-light text-dark border me-1">{{ keyword }}</span>
+                {% endfor %}
+              </div>
+              {% endif %}
+            </div>
+            <span class="badge bg-primary text-white">Match {{ task.match_score }}</span>
+          </div>
+        </a>
+        {% endfor %}
+      </div>
+      {% else %}
+      <p class="mb-0 text-dark">No suggested contributions right now. Keep posting and interacting to build better recommendations.</p>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endif %}
+
 <div class="mb-4 text-center">
 
 <!-- This is the 'sort' filter for New / Popular / Recommended -->
