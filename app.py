@@ -1075,7 +1075,7 @@ def user_risk_analysis(user_id):
     if not user:
         return 0.0
 
-    # Average posts and comments separately so prolific users do not dominate by volume.
+    # Average posts and comments separately.
     _, profile_score = moderate_content(user['profile'])
 
     post_scores = [
@@ -1090,7 +1090,7 @@ def user_risk_analysis(user_id):
     ]
     average_comment_score = sum(comment_scores) / len(comment_scores) if comment_scores else 0.0
 
-    # Posts carry triple weight; account age increases the score for newer accounts.
+    # Posts carry triple weight, account age increases the score for newer accounts.
     content_risk_score = profile_score + (average_post_score * 3) + average_comment_score
     age_days = (datetime.utcnow() - user['created_at']).days
     if age_days < 7:
