@@ -27,6 +27,41 @@ TIER1_WORDS = MODERATION_CONFIG['categories']['tier1_severe_violations']['words'
 TIER2_PHRASES = MODERATION_CONFIG['categories']['tier2_spam_scams']['phrases']
 TIER3_WORDS = MODERATION_CONFIG['categories']['tier3_mild_profanity']['words']
 
+
+def _whole_term_pattern(terms, include_plural=False):
+    # Match configured terms as complete words, with optional regular plurals.
+    alternatives = set()
+    for term in terms:
+        if not term:
+            continue
+        alternatives.add(re.escape(term))
+        if include_plural and re.fullmatch(r'\w+', term):
+            if term.endswith(('s', 'x', 'z', 'ch', 'sh')):
+                plural = term + 'es'
+            elif re.search(r'[^aeiou]y$', term, re.IGNORECASE):
+                plural = term[:-1] + 'ies'
+            else:
+                plural = term + 's'
+            alternatives.add(re.escape(plural))
+    alternatives = sorted(alternatives, key=len, reverse=True)
+    if not alternatives:
+        return None
+    return re.compile(r'(?<!\w)(?:' + '|'.join(alternatives) + r')(?!\w)', re.IGNORECASE)
+
+
+TIER1_PATTERN = _whole_term_pattern(TIER1_WORDS, include_plural=True)
+TIER2_PATTERN = _whole_term_pattern(TIER2_PHRASES)
+TIER3_PATTERN = _whole_term_pattern(TIER3_WORDS, include_plural=True)
+URL_PATTERN = re.compile(
+    r'(?<![\w@])(?:https?://)?(?:www\.)?'
+    r'[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?'
+    r'(?:(?:\.|\[\.\]|\(\.\)|\{\.\})'
+    r'[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+'
+    r'(?:[/?#][^\s<>"\']*)?',
+    re.IGNORECASE
+)
+
+
 def get_db():
     """
     Connect to the application's configured database. The connection
@@ -106,7 +141,7 @@ STOPWORDS = {
     'users','people','community','social','feed','platform','content','app','website','please','wow','love',
     'lol','haha','hahaha','amazing','awesome','great','good','nice','cool','fun','happy','sad','angry',
     'excited','interesting','interestingly','favorite','favourite','shared','sharing','today','tomorrow',
-    'yesterday','morning','evening','night','week','weekend','story','stories','stuff','thing','things'
+    'yesterday','morning','evening','night','week','weekend','story','stories','stuff','thing','things','link','org'
 }
 
 # Turn free text into a small set of useful topic keywords.
@@ -114,8 +149,14 @@ def extract_keywords(text, limit=8):
     if not text:
         return []
 
+    keyword_source = str(text)
+    # Prevent prohibited terms from becoming user interests or recommendation topics.
+    for pattern in (TIER1_PATTERN, TIER2_PATTERN, TIER3_PATTERN):
+        if pattern:
+            keyword_source = pattern.sub(' ', keyword_source)
+
     # Pull out word-like tokens from the text.
-    words = re.findall(r"[A-Za-z][A-Za-z0-9_'-]{2,}", str(text))
+    words = re.findall(r"[A-Za-z][A-Za-z0-9_'-]{2,}", keyword_source)
     keywords = []
 
     for word in words:
@@ -181,6 +222,11 @@ def build_contribution_tasks(user_id, limit=5):
         ORDER BY p.created_at DESC
         LIMIT 200
     ''', (user_id,)):
+        # Never recommend severe-violation or spam/scam posts, even from followed users.
+        if ((TIER1_PATTERN and TIER1_PATTERN.search(post['content'])) or
+                (TIER2_PATTERN and TIER2_PATTERN.search(post['content']))):
+            continue
+
         # Skip posts the user already engaged with so the queue stays useful.
         if query_db('SELECT 1 FROM comments WHERE post_id = ? AND user_id = ?', (post['id'], user_id), one=True):
             continue
@@ -523,7 +569,6 @@ def post_detail(post_id):
     for comment_raw in comments_raw:
         comment = dict(comment_raw) # Convert to a dictionary
         # Moderate the content of each comment
-        print(comment['content'])
         moderated_comment_content, _ = moderate_content(comment['content'])
         comment['content'] = moderated_comment_content
         comments.append(comment)
@@ -849,11 +894,12 @@ def admin_dashboard():
     all_users = []
     for user in all_users_raw:
         user_dict = dict(user)
+        user_dict['profile'], _ = moderate_content(user_dict.get('profile') or '')
         user_risk_score = user_risk_analysis(user_dict['id'])
         risk_label, risk_sort_key = get_risk_profile(user_risk_score)
         user_dict['risk_label'] = risk_label
         user_dict['risk_sort_key'] = risk_sort_key
-        user_dict['risk_score'] = min(5.0, round(user_risk_score, 2))
+        user_dict['risk_score'] = round(user_risk_score, 2)
         all_users.append(user_dict)
 
     all_users.sort(key=lambda x: x['risk_score'], reverse=True)
@@ -875,7 +921,7 @@ def admin_dashboard():
     posts = []
     for post in posts_raw:
         post_dict = dict(post)
-        _, base_score = moderate_content(post_dict['content'])
+        post_dict['content'], base_score = moderate_content(post_dict['content'])
         final_score = base_score 
         author_created_dt = post_dict['user_created_at']
         author_age_days = (datetime.utcnow() - author_created_dt).days
@@ -903,7 +949,7 @@ def admin_dashboard():
     comments = []
     for comment in comments_raw:
         comment_dict = dict(comment)
-        _, score = moderate_content(comment_dict['content'])
+        comment_dict['content'], score = moderate_content(comment_dict['content'])
         author_created_dt = comment_dict['user_created_at']
         author_age_days = (datetime.utcnow() - author_created_dt).days
         if author_age_days < 7:
@@ -1013,40 +1059,113 @@ def user_risk_analysis(user_id):
         user_id: The ID of the user on which we perform risk analysis.
 
     Returns:
-        A float number score showing the risk associated with this user. There are no strict rules or bounds to this score, other than that a score of less than 1.0 means no risk, 1.0 to 3.0 is low risk, 3.0 to 5.0 is medium risk and above 5.0 is high risk. (An upper bound of 5.0 is applied to this score elsewhere in the codebase) 
+        A risk score between 0.0 and 5.0, capped at 5.0. Scores of 5.0
+        are classified as HIGH.
         
         You will be able to check the scores by logging in with the administrator account:
             username: admin
             password: admin
         Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
-    
-    score = 0
+    user = query_db(
+        'SELECT profile, created_at FROM users WHERE id = ?',
+        (user_id,),
+        one=True
+    )
+    if not user:
+        return 0.0
 
-    return score;
+    # Average posts and comments separately so prolific users do not dominate by volume.
+    _, profile_score = moderate_content(user['profile'])
+
+    post_scores = [
+        moderate_content(post['content'])[1]
+        for post in query_db('SELECT content FROM posts WHERE user_id = ?', (user_id,))
+    ]
+    average_post_score = sum(post_scores) / len(post_scores) if post_scores else 0.0
+
+    comment_scores = [
+        moderate_content(comment['content'])[1]
+        for comment in query_db('SELECT content FROM comments WHERE user_id = ?', (user_id,))
+    ]
+    average_comment_score = sum(comment_scores) / len(comment_scores) if comment_scores else 0.0
+
+    # Posts carry triple weight; account age increases the score for newer accounts.
+    content_risk_score = profile_score + (average_post_score * 3) + average_comment_score
+    age_days = (datetime.utcnow() - user['created_at']).days
+    if age_days < 7:
+        content_risk_score *= 1.5
+    elif age_days < 30:
+        content_risk_score *= 1.2
+
+    # Keep the final user score within the specified 0-5 range.
+    return min(5.0, content_risk_score)
 
     
 # Assignment 2.1
 def moderate_content(content):
     """
     Args
-        content: the text content of a post or comment to be moderated.
+        content: the text content of a profile, post, or comment to be moderated.
         
     Returns: 
-        A tuple containing the moderated content (string) and a severity score (float). There are no strict rules or bounds to the severity score, other than that a score of less than 1.0 means no risk, 1.0 to 3.0 is low risk, 3.0 to 5.0 is medium risk and above 5.0 is high risk.
+        A tuple containing the moderated content and its content score.
     
-    This function moderates a string of content and calculates a severity score based on
-    rules loaded from the 'censorship.dat' file. These are already loaded as TIER1_WORDS, TIER2_PHRASES and TIER3_WORDS. Tier 1 corresponds to strong profanity, Tier 2 to scam/spam phrases and Tier 3 to mild profanity.
+    Severe violations remove the content. Lower-priority violations are censored
+    or stripped while contributing to the content score.
     
     You will be able to check the scores by logging in with the administrator account:
             username: admin
             password: admin
     Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
+    if content is None:
+        content = ''
+
+    # Remove severe and spam/scam content before applying lower-priority filters.
+    if TIER1_PATTERN and TIER1_PATTERN.search(content):
+        return '[content removed due to severe violation]', 5.0
+    if TIER2_PATTERN and TIER2_PATTERN.search(content):
+        return '[content removed due to spam/scam policy]', 5.0
 
     moderated_content = content
-    score = 0
-    
+    score = 0.0
+
+    # Mask each mild-profanity match and score every occurrence.
+    if TIER3_PATTERN:
+        tier3_matches = list(TIER3_PATTERN.finditer(moderated_content))
+        score += len(tier3_matches) * 2.0
+        moderated_content = TIER3_PATTERN.sub(
+            lambda match: '*' * len(match.group(0)),
+            moderated_content
+        )
+
+    # Replace each detected URL while preserving punctuation around it.
+    url_matches = list(URL_PATTERN.finditer(moderated_content))
+    score += len(url_matches) * 2.0
+
+    def replace_url(match):
+        url = match.group(0)
+        trimmed_url = url.rstrip('.,!?;:')
+        trailing_text = url[len(trimmed_url):]
+        closing_pairs = {')': '(', ']': '[', '}': '{'}
+        while trimmed_url and trimmed_url[-1] in closing_pairs:
+            closing = trimmed_url[-1]
+            if trimmed_url.count(closing) <= trimmed_url.count(closing_pairs[closing]):
+                break
+            trimmed_url = trimmed_url[:-1]
+            trailing_text = closing + trailing_text
+        return '[link removed]' + trailing_text
+
+    moderated_content = URL_PATTERN.sub(replace_url, moderated_content)
+
+    # Capitalization contributes to risk but does not alter the displayed text.
+    alphabetic_characters = [character for character in content if character.isalpha()]
+    if (len(alphabetic_characters) > 15 and
+            sum(character.isupper() for character in alphabetic_characters) >
+            len(alphabetic_characters) * 0.7):
+        score += 0.5
+
     return moderated_content, score
 
 # Coding Assignment #3
@@ -1077,4 +1196,3 @@ def recommend(user_id, filter_following):
 
 if __name__ == '__main__':
     app.run(debug=True, port=8080)
-
