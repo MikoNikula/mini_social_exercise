@@ -3,6 +3,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from cryptography.fernet import Fernet
 import collections
 import json
+import secrets
 import sqlite3
 import hashlib
 import re
@@ -76,6 +77,25 @@ def get_db():
         g.db.row_factory = sqlite3.Row
 
     return g.db
+
+
+def ensure_referral_tables():
+    # Keep referral tracking separate from existing user records 
+    db = get_db()
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS referral_codes (
+            user_id INTEGER PRIMARY KEY,
+            code TEXT NOT NULL UNIQUE
+        )
+    ''')
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS signup_attributions (
+            user_id INTEGER PRIMARY KEY,
+            referrer_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+        )
+    ''')
+    db.commit()
 
 
 @app.teardown_appcontext
@@ -590,8 +610,70 @@ def privacy():
     return render_template('privacy.html.j2')
 
 
+@app.route('/invite')
+def invite():
+    user_id = session.get('user_id')
+    if not user_id:
+        flash('Log in to invite people to the community.', 'info')
+        return redirect(url_for('login'))
+
+    ensure_referral_tables()
+    db = get_db()
+    referral_code = db.execute(
+        'SELECT code FROM referral_codes WHERE user_id = ?', (user_id,)
+    ).fetchone()
+    if not referral_code:
+        # Reuse a member's code on later visits; retry if a generated code collides.
+        while True:
+            code = secrets.token_urlsafe(9)
+            db.execute(
+                'INSERT OR IGNORE INTO referral_codes (user_id, code) VALUES (?, ?)',
+                (user_id, code)
+            )
+            referral_code = db.execute(
+                'SELECT code FROM referral_codes WHERE user_id = ?', (user_id,)
+            ).fetchone()
+            if referral_code:
+                db.commit()
+                break
+
+    invited_count = db.execute(
+        'SELECT COUNT(*) FROM signup_attributions WHERE referrer_id = ?', (user_id,)
+    ).fetchone()[0]
+    referral_count = db.execute(
+        'SELECT COUNT(*) FROM signup_attributions WHERE referrer_id IS NOT NULL'
+    ).fetchone()[0]
+    direct_count = db.execute(
+        'SELECT COUNT(*) FROM signup_attributions WHERE referrer_id IS NULL'
+    ).fetchone()[0]
+
+    return render_template(
+        'invite.html.j2',
+        invite_url=url_for('signup', ref=referral_code['code'], _external=True),
+        invited_count=invited_count,
+        referral_count=referral_count,
+        direct_count=direct_count,
+    )
+
+
 @app.route('/signup', methods=['GET', 'POST'])
 def signup():
+    ensure_referral_tables()
+    # Resolve the invite on both the initial form request and its submitted form.
+    referral_code = request.form.get('referral_code', '').strip()
+    if request.method == 'GET':
+        referral_code = request.args.get('ref', '').strip()
+    referrer = None
+    if referral_code:
+        referrer = query_db(
+            '''SELECT u.id, u.username
+               FROM referral_codes rc
+               JOIN users u ON u.id = rc.user_id
+               WHERE rc.code = ?''',
+            (referral_code,),
+            one=True
+        )
+
     if request.method == 'POST':
         username = request.form['username']
         password = request.form['password']
@@ -608,17 +690,25 @@ def signup():
                 'INSERT INTO users (username, password, location, birthdate, profile) VALUES (?, ?, ?, ?, ?)',
                 (username, hashed_password, location, birthdate, profile)
             )
+            new_user_id = cur.lastrowid
+            referrer_id = referrer['id'] if referrer else None
+            # Store the source for every signup
+            if referrer_id != new_user_id:
+                db.execute(
+                    'INSERT INTO signup_attributions (user_id, referrer_id) VALUES (?, ?)',
+                    (new_user_id, referrer_id)
+                )
+            else:
+                db.execute(
+                    'INSERT INTO signup_attributions (user_id, referrer_id) VALUES (?, NULL)',
+                    (new_user_id,)
+                )
             db.commit()
 
-            # 1. Get the ID of the user we just created.
-            new_user_id = cur.lastrowid
-
-            # 2. Add user info to the session cookie.
             session.clear() # Clear any old session data
             session['user_id'] = new_user_id
             session['username'] = username
 
-            # 3. Flash a welcome message and redirect to the feed.
             flash(f'Welcome, {username}! Your account has been created.', 'success')
             return redirect(url_for('feed')) # Redirect to the main feed/dashboard
 
@@ -628,7 +718,11 @@ def signup():
             cur.close()
             db.close()
             
-    return render_template('signup.html.j2')
+    return render_template(
+        'signup.html.j2',
+        referral_code=referral_code if referrer else '',
+        referrer_username=referrer['username'] if referrer else None,
+    )
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -1190,9 +1284,109 @@ def recommend(user_id, filter_following):
     - https://www.researchgate.net/publication/227268858_Recommender_Systems_Handbook
     """
 
-    recommended_posts = {} 
+    # stronger reactions contribute more to the topic profile.
+    followed_ids = set()
+    topic_weights = collections.Counter()
+    followed_topics = collections.Counter()
 
-    return recommended_posts;
+    if user_id:
+        followed_ids = {
+            row['followed_id']
+            for row in query_db(
+                'SELECT followed_id FROM follows WHERE follower_id = ?', (user_id,)
+            )
+        }
+
+        for row in query_db('''
+            SELECT p.content,
+                   MAX(CASE r.reaction_type
+                       WHEN 'like' THEN 3
+                       WHEN 'love' THEN 3
+                       WHEN 'wow' THEN 2
+                       WHEN 'laugh' THEN 2
+                       WHEN 'haha' THEN 2
+                       ELSE 0
+                   END) AS weight
+            FROM reactions r
+            JOIN posts p ON p.id = r.post_id
+            WHERE r.user_id = ?
+              AND r.reaction_type IN ('like', 'love', 'wow', 'laugh', 'haha')
+            GROUP BY p.id
+        ''', (user_id,)):
+            for keyword in set(extract_keywords(row['content'], limit=20)):
+                topic_weights[keyword] += row['weight']
+
+        if followed_ids:
+            # Count followed author topics
+            placeholders = ','.join('?' for _ in followed_ids)
+            followed_posts = query_db(f'''
+                SELECT user_id, content FROM posts
+                WHERE user_id IN ({placeholders})
+            ''', tuple(followed_ids))
+            topics_by_author = collections.defaultdict(set)
+            for post in followed_posts:
+                topics_by_author[post['user_id']].update(
+                    extract_keywords(post['content'], limit=20)
+                )
+            for author_topics in topics_by_author.values():
+                for keyword in author_topics:
+                    followed_topics[keyword] += 1
+
+    # Remove posts already seen through authorship or prior interaction
+    where_clauses = []
+    params = []
+    if user_id:
+        where_clauses.extend([
+            'p.user_id != ?',
+            'NOT EXISTS (SELECT 1 FROM reactions r WHERE r.post_id = p.id AND r.user_id = ?)',
+            'NOT EXISTS (SELECT 1 FROM comments c WHERE c.post_id = p.id AND c.user_id = ?)',
+        ])
+        params.extend((user_id, user_id, user_id))
+    if filter_following:
+        if not followed_ids:
+            return []
+        placeholders = ','.join('?' for _ in followed_ids)
+        where_clauses.append(f'p.user_id IN ({placeholders})')
+        params.extend(followed_ids)
+    where_sql = 'WHERE ' + ' AND '.join(where_clauses) if where_clauses else ''
+
+    candidates = query_db(f'''
+        SELECT p.id, p.content, p.created_at, u.username, u.id AS user_id,
+               COUNT(r.id) AS total_reactions
+        FROM posts p
+        JOIN users u ON u.id = p.user_id
+        LEFT JOIN reactions r ON r.post_id = p.id
+        {where_sql}
+        GROUP BY p.id
+    ''', tuple(params))
+
+    # Exclude prohibited content and select the top five.
+    ranked_posts = []
+    for post in candidates:
+        if ((TIER1_PATTERN and TIER1_PATTERN.search(post['content'])) or
+                (TIER2_PATTERN and TIER2_PATTERN.search(post['content']))):
+            continue
+
+        post_topics = set(extract_keywords(post['content'], limit=20))
+        topic_score = sum(
+            topic_weights[keyword] + followed_topics[keyword] * 0.5
+            for keyword in post_topics
+        )
+        followed_author_score = 3 if post['user_id'] in followed_ids else 0
+        popularity_score = min(post['total_reactions'], 20) * 0.05
+        relevance_score = topic_score + followed_author_score
+        ranked_posts.append((
+            relevance_score,
+            popularity_score,
+            post['created_at'],
+            post,
+        ))
+
+    ranked_posts.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    selected_posts = [item[3] for item in ranked_posts[:5]]
+    # Keep the selected recommendations in the feeds expected newest first order.
+    selected_posts.sort(key=lambda post: post['created_at'], reverse=True)
+    return selected_posts
 
 if __name__ == '__main__':
     app.run(debug=True, port=8080)

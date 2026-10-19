@@ -1,0 +1,39 @@
+{% extends "base.html.j2" %}
+{% block content %}
+<div class="container col-md-8 mx-auto mt-5">
+  <div class="card p-4">
+    <h2 class="mb-3">Invite people to Mini Social</h2>
+    <p>Bring people you know into the community. Share your personal invite link with friends and communities you belong to.</p>
+
+    <label for="invite-link" class="form-label">Your invite link</label>
+    <div class="input-group mb-3">
+      <input id="invite-link" class="form-control" type="url" value="{{ invite_url }}" readonly>
+      <button class="btn btn-outline-primary" type="button" onclick="document.getElementById('invite-link').select(); document.execCommand('copy'); this.textContent = 'Copied';">Copy link</button>
+    </div>
+    <p class="text-muted small">Anyone who signs up through this link will be counted as a member you invited. No contacts are uploaded or messaged automatically.</p>
+
+    <h3 class="h5 mt-3">Community signups since invite tracking began</h3>
+    <div class="row text-center g-3">
+      <div class="col-sm-4">
+        <div class="border rounded p-3 h-100">
+          <strong class="d-block fs-4">{{ invited_count }}</strong>
+          <span>Joined through your link</span>
+        </div>
+      </div>
+      <div class="col-sm-4">
+        <div class="border rounded p-3 h-100">
+          <strong class="d-block fs-4">{{ referral_count }}</strong>
+          <span>Joined through member invites</span>
+        </div>
+      </div>
+      <div class="col-sm-4">
+        <div class="border rounded p-3 h-100">
+          <strong class="d-block fs-4">{{ direct_count }}</strong>
+          <span>Joined without an invite link</span>
+        </div>
+      </div>
+    </div>
+    <p class="text-muted small mt-3 mb-0">Counts include new signups after invite tracking was introduced and show referral attribution, not a causal comparison.</p>
+  </div>
+</div>
+{% endblock %}

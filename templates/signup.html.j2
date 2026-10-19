@@ -3,7 +3,15 @@
 <div class="container col-md-6 mx-auto mt-5">
   <div class="card p-4">
     <h2 class="mb-4 text-center">Sign Up</h2>
+    {% if referrer_username %}
+    <div class="alert alert-info" role="status">
+      You were invited by <strong>@{{ referrer_username }}</strong>. Joining through their invite helps grow the community through member networks.
+    </div>
+    {% endif %}
     <form method="POST">
+      {% if referral_code %}
+      <input type="hidden" name="referral_code" value="{{ referral_code }}">
+      {% endif %}
       <div class="mb-3">
         <label for="username" class="form-label">Username</label>
         <input type="text" class="form-control" id="username" name="username" required>
