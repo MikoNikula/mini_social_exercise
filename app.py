@@ -414,11 +414,12 @@ def add_post():
         flash('You must be logged in to create a post.', 'danger')
         return redirect(url_for('login'))
 
-    # Get content from the submitted form
+    # Prescreen before saving so severe or spam/scam content is never stored.
     content = request.form.get('content')
-
-    # Pass the user's content through the moderation function
-    moderated_content = content
+    moderated_content, _, allowed = prescreen_submission(content)
+    if not allowed:
+        flash('Post rejected: it violates the severe-content or spam/scam policy.', 'danger')
+        return redirect(url_for('feed'))
 
     # Basic validation to ensure post is not empty
     if moderated_content and moderated_content.strip():
@@ -681,6 +682,15 @@ def signup():
         birthdate = request.form.get('birthdate', '')
         profile = request.form.get('profile', '')
 
+        profile, _, allowed = prescreen_submission(profile)
+        if not allowed:
+            flash('Profile rejected: it violates the severe-content or spam/scam policy.', 'danger')
+            return render_template(
+                'signup.html.j2',
+                referral_code=referral_code if referrer else '',
+                referrer_username=referrer['username'] if referrer else None,
+            )
+
         hashed_password = generate_password_hash(password)
 
         db = get_db()
@@ -765,14 +775,18 @@ def add_comment(post_id):
         flash('You must be logged in to comment.', 'danger')
         return redirect(url_for('login'))
 
-    # Get content from the submitted form
+    # Prescreen before saving so severe or spam/scam content is never stored.
     content = request.form.get('content')
+    moderated_content, _, allowed = prescreen_submission(content)
+    if not allowed:
+        flash('Comment rejected: it violates the severe-content or spam/scam policy.', 'danger')
+        return redirect(request.referrer or url_for('post_detail', post_id=post_id))
 
     # Basic validation to ensure comment is not empty
-    if content and content.strip():
+    if moderated_content and moderated_content.strip():
         db = get_db()
         db.execute('INSERT INTO comments (post_id, user_id, content) VALUES (?, ?, ?)',
-                   (post_id, user_id, content))
+                   (post_id, user_id, moderated_content))
         db.commit()
         flash('Your comment was added.', 'success')
     else:
@@ -1261,6 +1275,15 @@ def moderate_content(content):
         score += 0.5
 
     return moderated_content, score
+
+
+def prescreen_submission(content):
+    """Return filtered text, its moderation score, and whether it may be stored."""
+    filtered_content, score = moderate_content(content)
+    has_severe_violation = bool(TIER1_PATTERN and TIER1_PATTERN.search(content or ''))
+    has_spam_or_scam = bool(TIER2_PATTERN and TIER2_PATTERN.search(content or ''))
+    return filtered_content, score, not (has_severe_violation or has_spam_or_scam)
+
 
 # Coding Assignment #3
 # Assignment 3.1
